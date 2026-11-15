@@ -1,0 +1,6 @@
+{
+  "name": "A股ETF ATR数据分析与高清导出",
+  "description": "整理A股ETF市场ATR（真实波动幅度均值）数据，支持多周期计算、波动率排行、海龟止损参考，一键导出带水印高清长图与精选卡片（公众号：我爱这young）。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
