@@ -11,6 +11,7 @@ import {
   Activity,
   Flame,
   ArrowDownToLine,
+  History,
 } from 'lucide-react';
 import { EtfItem, AtrPeriod, SortField, SortDirection } from '../types';
 import { formatAmount } from '../utils/atrCalculator';
@@ -21,6 +22,7 @@ interface EtfTableProps {
   onToggleSelect: (id: string) => void;
   onSelectAllVisible: (checked: boolean) => void;
   onOpenTurtleWithEtf: (etf: EtfItem) => void;
+  onOpenT0Backtest?: (etf?: EtfItem) => void;
   onDeleteEtf: (id: string) => void;
   sortField: SortField;
   sortDirection: SortDirection;
@@ -29,6 +31,7 @@ interface EtfTableProps {
   searchQuery?: string;
   onQuickAddFromQuery?: (q: string) => void;
   isTouchLowOnly?: boolean;
+  similarGroupCounts?: Record<string, number>;
 }
 
 export const EtfTable: React.FC<EtfTableProps> = ({
@@ -37,6 +40,7 @@ export const EtfTable: React.FC<EtfTableProps> = ({
   onToggleSelect,
   onSelectAllVisible,
   onOpenTurtleWithEtf,
+  onOpenT0Backtest,
   onDeleteEtf,
   sortField,
   sortDirection,
@@ -45,6 +49,7 @@ export const EtfTable: React.FC<EtfTableProps> = ({
   searchQuery,
   onQuickAddFromQuery,
   isTouchLowOnly = false,
+  similarGroupCounts,
 }) => {
   const [filterAboveAvgOnly, setFilterAboveAvgOnly] = useState(false);
 
@@ -110,6 +115,18 @@ export const EtfTable: React.FC<EtfTableProps> = ({
             <Flame className="w-3 h-3 text-rose-500 fill-rose-500" />
             <span>只看超历史均值 ({aboveAvgCount})</span>
           </button>
+          {onOpenT0Backtest && (
+            <button
+              type="button"
+              id="section1-t0-backtest-btn"
+              onClick={() => onOpenT0Backtest()}
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-semibold bg-slate-900 hover:bg-slate-800 text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              title="对板块一单只或已选ETF进行日内做T网格历史回测"
+            >
+              <History className="w-3.5 h-3.5" />
+              <span>日内做T网格回测</span>
+            </button>
+          )}
         </div>
       </div>
 
@@ -234,7 +251,7 @@ export const EtfTable: React.FC<EtfTableProps> = ({
                   )}
                 </button>
               </th>
-              <th className="py-3 px-3 text-center w-20">操作</th>
+              <th className="py-3 px-3 text-center w-28">操作</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-slate-100">
@@ -327,6 +344,14 @@ export const EtfTable: React.FC<EtfTableProps> = ({
                         <span className="px-1.5 py-0.2 rounded text-[10px] font-medium bg-slate-100 text-slate-600">
                           {item.category}
                         </span>
+                        {similarGroupCounts && (similarGroupCounts[item.id] ?? 1) > 1 && (
+                          <span
+                            className="px-1.5 py-0.2 rounded text-[10px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-200"
+                            title={`已开启「同类只显示一只」，此标的代表同类 ${similarGroupCounts[item.id]} 只ETF（优先按规模与成交额精选）`}
+                          >
+                            同类共{similarGroupCounts[item.id]}只·代表
+                          </span>
+                        )}
                         {isAboveAvg && (
                           <span className="text-[10px] font-mono text-rose-600/90 font-medium">
                             (近20日基线: ¥{(item.historicalAvgAtr ?? item.atr).toFixed(3)})
@@ -459,16 +484,26 @@ export const EtfTable: React.FC<EtfTableProps> = ({
                   {/* Actions */}
                   <td className="py-2.5 px-3 text-center">
                     <div className="flex items-center justify-center gap-1">
+                      {onOpenT0Backtest && (
+                        <button
+                          type="button"
+                          onClick={() => onOpenT0Backtest(item)}
+                          className="p-1.5 text-slate-500 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors cursor-pointer"
+                          title="对该ETF进行日内做T网格回测"
+                        >
+                          <History className="w-3.5 h-3.5" />
+                        </button>
+                      )}
                       <button
                         onClick={() => onOpenTurtleWithEtf(item)}
-                        className="p-1.5 text-slate-500 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-colors"
+                        className="p-1.5 text-slate-500 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-colors cursor-pointer"
                         title="测算该ETF海龟建仓与止损点"
                       >
                         <Calculator className="w-3.5 h-3.5" />
                       </button>
                       <button
                         onClick={() => onDeleteEtf(item.id)}
-                        className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors"
+                        className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors cursor-pointer"
                         title="从列表中移除"
                       >
                         <Trash2 className="w-3.5 h-3.5" />

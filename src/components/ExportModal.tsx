@@ -24,6 +24,7 @@ import {
 import { EtfItem, ExportConfig, ExportTheme, ExportLayout, ExportAspectRatio, AtrPeriod, GridItemConfig } from '../types';
 import { ExportCardView } from './ExportCardView';
 import { renderExportCardToBlob } from '../utils/exportCardCanvas';
+import { exportSection2GridToXlsx } from '../utils/gridExcelExporter';
 
 interface ExportModalProps {
   isOpen: boolean;
@@ -426,6 +427,42 @@ export const ExportModal: React.FC<ExportModalProps> = ({
       link.download = `A股ETF_ATR波幅表_${config.selectedOnly && selectedCount > 0 ? `已选${targetItems.length}只` : '全部'}_${new Date().toISOString().slice(0, 10)}.csv`;
       link.click();
       URL.revokeObjectURL(url);
+    }
+  };
+
+  // 导出网格参数为 XLSX 工作簿（板块二）
+  const handleDownloadGridXlsx = async () => {
+    const selectedIds = new Set(selectedEtfs.map((e) => e.id));
+    const targetItems =
+      config.selectedOnly && selectedCount > 0 && gridItems
+        ? gridItems.filter((g) => selectedIds.has(g.id))
+        : gridItems || [];
+
+    if (targetItems.length === 0) {
+      setErrorMsg('暂无可导出的网格标的数据');
+      return;
+    }
+
+    setIsExporting(true);
+    setErrorMsg(null);
+    try {
+      const scopeLabel =
+        config.selectedOnly && selectedCount > 0
+          ? `已选${targetItems.length}只`
+          : `共${targetItems.length}只`;
+      await exportSection2GridToXlsx({
+        items: targetItems,
+        etfs,
+        globalConfig: {
+          atrPeriod: config.atrPeriod || atrPeriod,
+          scopeLabel,
+        },
+      });
+    } catch (err) {
+      console.error('Export grid XLSX failed:', err);
+      setErrorMsg('导出 XLSX 失败，请稍后重试');
+    } finally {
+      setIsExporting(false);
     }
   };
 
@@ -1273,7 +1310,19 @@ export const ExportModal: React.FC<ExportModalProps> = ({
             <span>已选标的：{currentExportCount} 只</span>
           </div>
 
-          <div className="flex items-center gap-2 w-full sm:w-auto">
+          <div className="flex items-center gap-2 w-full sm:w-auto flex-wrap">
+            {config.layout === 'grid_trading' && (
+              <button
+                id="confirm-download-grid-xlsx-btn"
+                onClick={handleDownloadGridXlsx}
+                disabled={isExporting}
+                className="flex-1 sm:flex-initial inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg border border-emerald-600 bg-emerald-700 hover:bg-emerald-800 text-xs font-semibold text-white transition-colors disabled:opacity-50"
+                title="下载完整网格参数、买卖阶梯及全局配置 (.xlsx)"
+              >
+                <FileSpreadsheet className="w-4 h-4" />
+                <span>下载 XLSX</span>
+              </button>
+            )}
             <button
               id="confirm-download-csv-btn"
               onClick={handleDownloadCsv}

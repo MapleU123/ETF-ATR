@@ -17,6 +17,15 @@ import {
   Layers,
   ArrowUpDown,
   Sparkles,
+  Tag,
+  Building2,
+  Ban,
+  CheckCheck,
+  Filter,
+  Flame,
+  ArrowDownToLine,
+  Coins,
+  FileSpreadsheet,
 } from 'lucide-react';
 import { EtfItem, EtfCategory, AtrPeriod, GridItemConfig, GridRangeMode } from '../types';
 import {
@@ -27,13 +36,23 @@ import {
   generateGridLadder,
   GridLadderLevel,
 } from '../utils/gridCalculator';
+import { exportSection2GridToXlsx } from '../utils/gridExcelExporter';
+import {
+  EtfNameFilterState,
+  DEFAULT_NAME_FILTER,
+  matchesEtfNameFilter,
+  getAvailableNameThemes,
+  getAvailableFundIssuers,
+  dedupeSimilarEtfs,
+  parseEtfScaleValue,
+} from '../utils/etfNameFilter';
 
 interface GridTradingSectionProps {
   etfs: EtfItem[];
   atrPeriod: AtrPeriod;
   onPeriodChange: (p: AtrPeriod) => void;
   onToggleSelect: (id: string) => void;
-  onSelectAll: () => void;
+  onSelectAll: (ids?: string[]) => void;
   onDeselectAll: () => void;
   onOpenExportGrid: (items?: GridItemConfig[], selectedOnly?: boolean) => void;
 }
@@ -53,8 +72,20 @@ export const GridTradingSection: React.FC<GridTradingSectionProps> = ({
   const [rangePercent, setRangePercent] = useState<number>(20);
   const [rangeMode, setRangeMode] = useState<GridRangeMode>('kline_120d'); // 默认使用 120日K线极值 (前复权：最高价=120日High最大值，最低价=120日Low最小值)
   const [searchQuery, setSearchQuery] = useState<string>('');
-  const [selectedCategory, setSelectedCategory] = useState<EtfCategory>('全部');
+  const [selectedCategories, setSelectedCategories] = useState<EtfCategory[]>([]); // 空数组表示全部
+  const [isMultiCategoryMode, setIsMultiCategoryMode] = useState<boolean>(false); // 跨分类多选模式
+  const [dedupeSimilarOnly, setDedupeSimilarOnly] = useState<boolean>(false); // 同类只显示一只
   const [onlyShowSelected, setOnlyShowSelected] = useState<boolean>(false); // 是否仅看已勾选
+  const [nameFilter, setNameFilter] = useState<EtfNameFilterState>(DEFAULT_NAME_FILTER);
+  // 量化条件筛选与排序（对齐并扩展板块一筛选能力）
+  const [isTouchLowOnly, setIsTouchLowOnly] = useState<boolean>(false);
+  const [isHighVolOnly, setIsHighVolOnly] = useState<boolean>(false);
+  const [isAboveAvgOnly, setIsAboveAvgOnly] = useState<boolean>(false);
+  const [minScale, setMinScale] = useState<number>(0); // 0=全部, 20/50/100=亿元门槛
+  const [gridSortField, setGridSortField] = useState<
+    'default' | 'gridStepPercent' | 'gridCount' | 'scaleAmount' | 'price' | 'volumeAmount' | 'code'
+  >('default');
+  const [gridSortDirection, setGridSortDirection] = useState<'desc' | 'asc'>('desc');
 
   // 单个标的个性化覆盖 { [id]: { basePrice?, highPrice?, lowPrice?, gridStepPercent? } }
   const [customOverrides, setCustomOverrides] = useState<
@@ -85,6 +116,8 @@ export const GridTradingSection: React.FC<GridTradingSectionProps> = ({
 
   // 阶梯抽屉/查看状态
   const [inspectLadderItem, setInspectLadderItem] = useState<GridItemConfig | null>(null);
+  const [isExportingXlsx, setIsExportingXlsx] = useState<boolean>(false);
+  const [xlsxNotice, setXlsxNotice] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
 
   // 计算所有标的的网格参数（支持近120日K线实际高低价或百分比箱体，以及0.5%倍数对齐）
   const gridItems = useMemo(() => {
@@ -94,39 +127,216 @@ export const GridTradingSection: React.FC<GridTradingSectionProps> = ({
     });
   }, [etfs, atrMultiplier, rangePercent, customOverrides, roundToHalf, rangeMode]);
 
-  // 筛选标的
-  const filteredGridItems = useMemo(() => {
-    return gridItems.filter((item) => {
-      if (onlyShowSelected) {
-        const originalEtf = etfs.find((e) => e.id === item.id);
-        if (!originalEtf?.selected) return false;
-      }
-      const matchCat =
-        selectedCategory === '全部' || item.category === selectedCategory;
-      const q = searchQuery.toLowerCase().trim();
-      const matchSearch =
-        !q ||
-        item.name.toLowerCase().includes(q) ||
-        item.code.toLowerCase().includes(q);
-      return matchCat && matchSearch;
-    });
-  }, [gridItems, selectedCategory, searchQuery, onlyShowSelected, etfs]);
+  const etfById = useMemo(() => {
+    const map = new Map<string, EtfItem>();
+    for (const e of etfs) {
+      map.set(e.id, e);
+    }
+    return map;
+  }, [etfs]);
 
-  // 统计概览
+  const selectedByCategory = useMemo(() => {
+    const map = new Map<EtfCategory, number>();
+    for (const e of etfs) {
+      if (e.selected) {
+        map.set(e.category, (map.get(e.category) || 0) + 1);
+      }
+    }
+    return Array.from(map.entries()).map(([category, count]) => ({ category, count }));
+  }, [etfs]);
+
+  const selectedCategoryCountMap = useMemo(
+    () => new Map<EtfCategory, number>(selectedByCategory.map((i) => [i.category, i.count])),
+    [selectedByCategory]
+  );
+
+  // 当前分类与勾选范围下的标的子集（用于动态计算名称主题与基金公司选项）
+  const categoryScopedGridItems = useMemo(() => {
+    return gridItems.filter((item) => {
+      if (onlyShowSelected && !etfById.get(item.id)?.selected) {
+        return false;
+      }
+      if (selectedCategories.length > 0 && !selectedCategories.includes(item.category)) {
+        return false;
+      }
+      return true;
+    });
+  }, [gridItems, selectedCategories, onlyShowSelected, etfById]);
+
+  const availableNameThemes = useMemo(
+    () => getAvailableNameThemes(categoryScopedGridItems),
+    [categoryScopedGridItems]
+  );
+
+  const availableFundIssuers = useMemo(
+    () => getAvailableFundIssuers(categoryScopedGridItems),
+    [categoryScopedGridItems]
+  );
+
+  // 统计当前分类范围内的触及低位 / 高波动 / 超历史均值标的数
+  const { touchLowCount, highVolCount, aboveAvgCount } = useMemo(() => {
+    let touchLow = 0;
+    let highVol = 0;
+    let aboveAvg = 0;
+    for (const item of categoryScopedGridItems) {
+      const orig = etfById.get(item.id);
+      if (!orig) continue;
+      const low60 = orig.low60d || orig.low120d || orig.low;
+      if (low60 > 0 && orig.price <= low60 * 1.0501) touchLow++;
+      if (orig.atrPercent >= 2.6) highVol++;
+      if (orig.isAboveHistoricalAvg) aboveAvg++;
+    }
+    return { touchLowCount: touchLow, highVolCount: highVol, aboveAvgCount: aboveAvg };
+  }, [categoryScopedGridItems, etfById]);
+
+  const handleSortToggle = (
+    field: 'gridStepPercent' | 'gridCount' | 'scaleAmount' | 'price' | 'volumeAmount' | 'code'
+  ) => {
+    if (gridSortField === field) {
+      setGridSortDirection((prev) => (prev === 'desc' ? 'asc' : 'desc'));
+    } else {
+      setGridSortField(field);
+      setGridSortDirection('desc');
+    }
+  };
+
+  // 筛选、同类去重与排序
+  const { filteredGridItems, similarGroupCounts, preDedupeCount } = useMemo(() => {
+    const matched = categoryScopedGridItems.filter((item) => {
+      if (!matchesEtfNameFilter(item, searchQuery, nameFilter)) return false;
+
+      const orig = etfById.get(item.id);
+      if (isTouchLowOnly) {
+        const low60 = orig?.low60d || orig?.low120d || orig?.low || 0;
+        if (!(low60 > 0 && item.price <= low60 * 1.0501)) return false;
+      }
+      if (isHighVolOnly) {
+        if ((orig?.atrPercent ?? item.atrPercent) < 2.6) return false;
+      }
+      if (isAboveAvgOnly) {
+        if (!orig?.isAboveHistoricalAvg) return false;
+      }
+      if (minScale > 0) {
+        const scale = orig ? parseEtfScaleValue(orig) : 0;
+        if (scale < minScale) return false;
+      }
+      return true;
+    });
+
+    const preCount = matched.length;
+    let working = matched;
+    let groupCounts: Record<string, number> = {};
+
+    if (dedupeSimilarOnly) {
+      const deduped = dedupeSimilarEtfs(matched, (item) => {
+        const orig = etfById.get(item.id);
+        const scale = orig ? parseEtfScaleValue(orig) : 0;
+        const vol = orig?.volumeAmount ?? 0;
+        return scale * 1_000_000 + vol * 1_000 + item.atrPercent;
+      });
+      working = deduped.items;
+      groupCounts = deduped.groupCounts;
+    }
+
+    if (gridSortField !== 'default') {
+      working = [...working].sort((a, b) => {
+        const origA = etfById.get(a.id);
+        const origB = etfById.get(b.id);
+        let valA = 0;
+        let valB = 0;
+
+        if (gridSortField === 'gridStepPercent') {
+          valA = a.gridStepPercent;
+          valB = b.gridStepPercent;
+        } else if (gridSortField === 'gridCount') {
+          valA = a.gridCount;
+          valB = b.gridCount;
+        } else if (gridSortField === 'price') {
+          valA = a.price;
+          valB = b.price;
+        } else if (gridSortField === 'scaleAmount') {
+          valA = origA ? parseEtfScaleValue(origA) : 0;
+          valB = origB ? parseEtfScaleValue(origB) : 0;
+        } else if (gridSortField === 'volumeAmount') {
+          valA = origA?.volumeAmount ?? 0;
+          valB = origB?.volumeAmount ?? 0;
+        } else if (gridSortField === 'code') {
+          return gridSortDirection === 'desc'
+            ? b.code.localeCompare(a.code)
+            : a.code.localeCompare(b.code);
+        }
+
+        return gridSortDirection === 'desc' ? valB - valA : valA - valB;
+      });
+    }
+
+    return {
+      filteredGridItems: working,
+      similarGroupCounts: groupCounts,
+      preDedupeCount: preCount,
+    };
+  }, [
+    categoryScopedGridItems,
+    searchQuery,
+    nameFilter,
+    dedupeSimilarOnly,
+    etfById,
+    isTouchLowOnly,
+    isHighVolOnly,
+    isAboveAvgOnly,
+    minScale,
+    gridSortField,
+    gridSortDirection,
+  ]);
+
+  const handleSelectCategory = (cat: EtfCategory) => {
+    if (cat === '全部') {
+      setSelectedCategories([]);
+    } else if (isMultiCategoryMode) {
+      setSelectedCategories((prev) =>
+        prev.includes(cat) ? prev.filter((c) => c !== cat) : [...prev, cat]
+      );
+    } else {
+      setSelectedCategories([cat]);
+    }
+    setNameFilter((prev) => ({ ...prev, nameTheme: '全部' }));
+  };
+
+  const hasActiveNameFilter =
+    nameFilter.nameTheme !== '全部' ||
+    nameFilter.fundIssuer !== '全部' ||
+    nameFilter.excludeQuery.trim() !== '' ||
+    searchQuery.trim() !== '' ||
+    isTouchLowOnly ||
+    isHighVolOnly ||
+    isAboveAvgOnly ||
+    minScale > 0;
+
+  const handleResetNameFilters = () => {
+    setSearchQuery('');
+    setNameFilter(DEFAULT_NAME_FILTER);
+    setIsTouchLowOnly(false);
+    setIsHighVolOnly(false);
+    setIsAboveAvgOnly(false);
+    setMinScale(0);
+  };
+
+  // 统计概览（随当前筛选列表联动）
   const stats = useMemo(() => {
-    if (gridItems.length === 0) {
+    const source = filteredGridItems.length > 0 ? filteredGridItems : gridItems;
+    if (source.length === 0) {
       return { avgStep: '0.0', avgCount: 0, minStep: '0.0', maxStep: '0.0' };
     }
-    const sumStep = gridItems.reduce((acc, c) => acc + c.gridStepPercent, 0);
-    const avgStep = (sumStep / gridItems.length).toFixed(1);
-    const steps = gridItems.map((g) => g.gridStepPercent);
+    const sumStep = source.reduce((acc, c) => acc + c.gridStepPercent, 0);
+    const avgStep = (sumStep / source.length).toFixed(1);
+    const steps = source.map((g) => g.gridStepPercent);
     const minStep = Math.min(...steps).toFixed(1);
     const maxStep = Math.max(...steps).toFixed(1);
     const avgCount = Math.round(
-      gridItems.reduce((acc, c) => acc + c.gridCount, 0) / gridItems.length
+      source.reduce((acc, c) => acc + c.gridCount, 0) / source.length
     );
     return { avgStep, avgCount, minStep, maxStep };
-  }, [gridItems]);
+  }, [filteredGridItems, gridItems]);
 
   // 选中的标的数量
   const selectedCount = useMemo(() => {
@@ -258,6 +468,60 @@ export const GridTradingSection: React.FC<GridTradingSectionProps> = ({
     URL.revokeObjectURL(url);
   };
 
+  // 导出网格参数为 XLSX Excel 工作簿
+  const handleExportGridXlsx = async (onlySelected: boolean) => {
+    const targetItems = onlySelected
+      ? gridItems.filter((item) => etfById.get(item.id)?.selected)
+      : filteredGridItems;
+
+    if (targetItems.length === 0) {
+      setXlsxNotice({
+        type: 'err',
+        text: onlySelected ? '请先勾选需要导出的ETF标的' : '当前筛选条件下暂无可导出的ETF数据',
+      });
+      setTimeout(() => setXlsxNotice(null), 3200);
+      return;
+    }
+
+    const scopeLabel = onlySelected
+      ? `已选${targetItems.length}只`
+      : filteredGridItems.length < gridItems.length
+      ? `当前筛选${targetItems.length}只`
+      : `全部${targetItems.length}只`;
+
+    setIsExportingXlsx(true);
+    setXlsxNotice(null);
+    try {
+      await exportSection2GridToXlsx({
+        items: targetItems,
+        etfs,
+        customOverrides,
+        globalConfig: {
+          atrPeriod,
+          atrMultiplier,
+          rangeMode,
+          rangePercent,
+          roundToHalf,
+          scopeLabel,
+        },
+      });
+      setXlsxNotice({
+        type: 'ok',
+        text: `已导出 ${targetItems.length} 只标的的网格参数 XLSX 文件（含参数总览、买卖阶梯与全局配置）`,
+      });
+      setTimeout(() => setXlsxNotice(null), 3800);
+    } catch (err) {
+      console.error('Export Section 2 XLSX failed:', err);
+      setXlsxNotice({
+        type: 'err',
+        text: '导出 XLSX 失败，请稍后重试',
+      });
+      setTimeout(() => setXlsxNotice(null), 3200);
+    } finally {
+      setIsExportingXlsx(false);
+    }
+  };
+
   // 分类列表 (与板块一完全统一)
   const categories: EtfCategory[] = [
     '全部',
@@ -332,7 +596,7 @@ export const GridTradingSection: React.FC<GridTradingSectionProps> = ({
                   type="button"
                   onClick={() => onOpenExportGrid(gridItems, true)}
                   className="inline-flex items-center gap-2 px-4 py-2 text-xs font-bold text-white bg-rose-600 hover:bg-rose-700 active:bg-rose-800 rounded-l-xl transition-all shadow-xs"
-                  title={`仅导出在板块二选中的 ${selectedCount} 只 ETF 网格参数`}
+                  title={`仅导出跨分类选中的 ${selectedCount} 只 ETF 网格参数`}
                 >
                   <Download className="w-4 h-4" />
                   <span>导出选中的 ETF ({selectedCount}只)</span>
@@ -343,30 +607,106 @@ export const GridTradingSection: React.FC<GridTradingSectionProps> = ({
                 <button
                   id="export-grid-all-btn"
                   type="button"
-                  onClick={() => onOpenExportGrid(gridItems, false)}
+                  onClick={() => onOpenExportGrid(filteredGridItems, false)}
                   className="inline-flex items-center gap-1 px-3 py-2 text-xs font-medium text-rose-100 bg-rose-700 hover:bg-rose-800 active:bg-rose-900 rounded-r-xl border-l border-rose-500/50 transition-colors"
-                  title="导出全部ETF网格参数"
+                  title="导出当前筛选展示的ETF网格参数"
                 >
-                  <span>全部({gridItems.length})</span>
+                  <span>
+                    {filteredGridItems.length < gridItems.length
+                      ? `当前筛选(${filteredGridItems.length})`
+                      : `全部(${gridItems.length})`}
+                  </span>
                 </button>
               </div>
             ) : (
               <button
                 id="export-grid-btn"
                 type="button"
-                onClick={() => onOpenExportGrid(gridItems, false)}
+                onClick={() => onOpenExportGrid(filteredGridItems, false)}
                 className="inline-flex items-center gap-2 px-4 py-2 text-xs font-bold text-white bg-rose-600 hover:bg-rose-700 active:bg-rose-800 rounded-xl shadow-sm transition-all hover:shadow-md hover:shadow-rose-200"
-                title="未勾选特定标的时默认导出全部，您也可在左侧勾选特定ETF后再导出"
+                title="导出当前筛选列表的网格参数图片"
               >
                 <Download className="w-4 h-4" />
                 <span>导出网格参数图片</span>
                 <span className="text-[10px] bg-rose-700/80 px-1.5 py-0.5 rounded text-rose-100 font-normal">
-                  全部 {gridItems.length} 只
+                  {filteredGridItems.length < gridItems.length
+                    ? `当前筛选 ${filteredGridItems.length} 只`
+                    : `全部 ${gridItems.length} 只`}
+                </span>
+              </button>
+            )}
+
+            {/* 导出 XLSX Excel 工作簿按钮 */}
+            {selectedCount > 0 ? (
+              <div className="inline-flex items-center rounded-xl shadow-xs">
+                <button
+                  id="export-grid-xlsx-selected-btn"
+                  type="button"
+                  disabled={isExportingXlsx}
+                  onClick={() => handleExportGridXlsx(true)}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold text-white bg-emerald-700 hover:bg-emerald-800 active:bg-emerald-900 rounded-l-xl transition-all disabled:opacity-60 cursor-pointer"
+                  title={`导出跨分类选中的 ${selectedCount} 只 ETF 网格参数为 Excel (.xlsx) 文件`}
+                >
+                  <FileSpreadsheet className="w-4 h-4" />
+                  <span>{isExportingXlsx ? '导出中...' : `导出选中 XLSX (${selectedCount}只)`}</span>
+                </button>
+                <button
+                  id="export-grid-xlsx-filtered-btn"
+                  type="button"
+                  disabled={isExportingXlsx}
+                  onClick={() => handleExportGridXlsx(false)}
+                  className="inline-flex items-center gap-1 px-2.5 py-2 text-xs font-medium text-emerald-100 bg-emerald-800 hover:bg-emerald-900 rounded-r-xl border-l border-emerald-600/50 transition-colors disabled:opacity-60 cursor-pointer"
+                  title="导出当前筛选列表的 ETF 网格参数为 Excel (.xlsx) 文件"
+                >
+                  <span>
+                    {filteredGridItems.length < gridItems.length
+                      ? `筛选(${filteredGridItems.length})`
+                      : `全部(${gridItems.length})`}
+                  </span>
+                </button>
+              </div>
+            ) : (
+              <button
+                id="export-grid-xlsx-btn"
+                type="button"
+                disabled={isExportingXlsx}
+                onClick={() => handleExportGridXlsx(false)}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold text-white bg-emerald-700 hover:bg-emerald-800 active:bg-emerald-900 rounded-xl shadow-xs transition-all disabled:opacity-60 cursor-pointer"
+                title="导出当前网格参数与买卖阶梯为 Excel (.xlsx) 文件"
+              >
+                <FileSpreadsheet className="w-4 h-4" />
+                <span>{isExportingXlsx ? '导出中...' : '导出 XLSX'}</span>
+                <span className="text-[10px] bg-emerald-800/80 px-1.5 py-0.5 rounded text-emerald-100 font-normal">
+                  {filteredGridItems.length < gridItems.length
+                    ? `筛选 ${filteredGridItems.length} 只`
+                    : `全部 ${gridItems.length} 只`}
                 </span>
               </button>
             )}
           </div>
         </div>
+
+        {xlsxNotice && (
+          <div
+            className={`px-3.5 py-2 rounded-xl border text-xs font-medium flex items-center justify-between gap-2 ${
+              xlsxNotice.type === 'ok'
+                ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                : 'bg-rose-50 border-rose-200 text-rose-700'
+            }`}
+          >
+            <span className="flex items-center gap-1.5">
+              <FileSpreadsheet className="w-4 h-4 shrink-0" />
+              <span>{xlsxNotice.text}</span>
+            </span>
+            <button
+              type="button"
+              onClick={() => setXlsxNotice(null)}
+              className="text-current/70 hover:text-current text-xs px-1"
+            >
+              ✕
+            </button>
+          </div>
+        )}
 
         {/* 核心参数调节栏：0.5%倍数规范、ATR间距倍数、区间范围、ATR周期 */}
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3.5 pt-1">
@@ -646,91 +986,439 @@ export const GridTradingSection: React.FC<GridTradingSectionProps> = ({
       </div>
 
       {/* 搜索与分类筛选条 */}
-      <div className="bg-white rounded-xl p-3.5 border border-slate-200 shadow-xs flex flex-col md:flex-row md:items-center md:justify-between gap-3">
-        {/* 类别标签 */}
-        <div className="flex items-center gap-1.5 overflow-x-auto pb-1 md:pb-0 scrollbar-none">
-          {categories.map((cat) => (
+      <div className="bg-white rounded-xl p-3.5 border border-slate-200 shadow-xs space-y-3">
+        <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
+          {/* 类别标签 + 跨分类多选 */}
+          <div className="flex items-center gap-1.5 overflow-x-auto pb-1 lg:pb-0 scrollbar-none">
+            <span className="text-slate-400 font-medium whitespace-nowrap mr-0.5 flex items-center gap-1 text-xs">
+              <Filter className="w-3.5 h-3.5" />
+              分类:
+            </span>
             <button
-              key={cat}
               type="button"
-              onClick={() => setSelectedCategory(cat)}
-              className={`px-2.5 py-1 rounded-lg text-xs font-medium whitespace-nowrap transition-all ${
-                selectedCategory === cat
-                  ? 'bg-slate-900 text-white shadow-xs font-bold'
-                  : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+              onClick={() => setIsMultiCategoryMode((prev) => !prev)}
+              className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-semibold whitespace-nowrap transition-all border mr-0.5 ${
+                isMultiCategoryMode
+                  ? 'bg-indigo-600 text-white border-indigo-600 shadow-xs'
+                  : 'bg-indigo-50/70 text-indigo-700 border-indigo-200 hover:bg-indigo-100'
               }`}
+              title="开启后可同时勾选多个行业分类，跨分类对比与筛选标的"
             >
-              {cat}
+              <CheckCheck className="w-3.5 h-3.5" />
+              <span>{isMultiCategoryMode ? '多选分类中' : '跨分类多选'}</span>
+              {selectedCategories.length > 1 && (
+                <span className="text-[10px] px-1 rounded bg-white/20 font-mono">
+                  {selectedCategories.length}
+                </span>
+              )}
             </button>
-          ))}
+            {categories.map((cat) => {
+              const isActive =
+                cat === '全部'
+                  ? selectedCategories.length === 0
+                  : selectedCategories.includes(cat);
+              const catSelCount =
+                cat !== '全部' ? selectedCategoryCountMap.get(cat) || 0 : 0;
+              const showPartial = selectedCount > 0 && selectedCount < etfs.length;
+
+              return (
+                <button
+                  key={cat}
+                  type="button"
+                  onClick={() => handleSelectCategory(cat)}
+                  className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-medium whitespace-nowrap transition-all ${
+                    isActive
+                      ? 'bg-slate-900 text-white shadow-xs font-bold'
+                      : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                  }`}
+                >
+                  <span>{cat}</span>
+                  {showPartial && catSelCount > 0 && (
+                    <span
+                      className={`text-[10px] font-mono px-1 rounded font-bold ${
+                        isActive
+                          ? 'bg-rose-500 text-white'
+                          : 'bg-rose-100 text-rose-700'
+                      }`}
+                    >
+                      {catSelCount}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+
+          {/* 搜索与范围筛选 */}
+          <div className="flex items-center gap-2 shrink-0 flex-wrap">
+            {/* 显示范围切换：全部 / 仅看勾选 */}
+            <div className="inline-flex items-center bg-slate-100 p-0.5 rounded-lg border border-slate-200">
+              <button
+                type="button"
+                onClick={() => setOnlyShowSelected(false)}
+                className={`px-2 py-1 rounded text-xs font-medium transition-all ${
+                  !onlyShowSelected
+                    ? 'bg-white text-slate-900 font-bold shadow-2xs'
+                    : 'text-slate-500 hover:text-slate-800'
+                }`}
+              >
+                全部标的 ({etfs.length})
+              </button>
+              <button
+                type="button"
+                onClick={() => setOnlyShowSelected(true)}
+                className={`px-2 py-1 rounded text-xs font-medium transition-all ${
+                  onlyShowSelected
+                    ? 'bg-rose-600 text-white font-bold shadow-2xs'
+                    : 'text-slate-500 hover:text-slate-800'
+                }`}
+                title="仅筛选显示在板块一或此表跨分类勾选的标的"
+              >
+                仅看已勾选 ({selectedCount})
+              </button>
+            </div>
+
+            <div className="relative">
+              <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
+              <input
+                type="text"
+                placeholder="搜索代码 / 名称(空格多词)..."
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                className="pl-8 pr-6 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-rose-500 focus:bg-white w-44 sm:w-52"
+              />
+              {searchQuery && (
+                <button
+                  type="button"
+                  onClick={() => setSearchQuery('')}
+                  className="absolute right-1.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 text-xs px-1"
+                  title="清空搜索"
+                >
+                  ✕
+                </button>
+              )}
+            </div>
+
+            <button
+              type="button"
+              onClick={() => onSelectAll(filteredGridItems.map((i) => i.id))}
+              className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors whitespace-nowrap"
+              title="勾选当前筛选出的全部ETF（保留其他分类已勾选目标）"
+            >
+              <CheckSquare className="w-3.5 h-3.5 text-rose-600" />
+              <span>全选当前 ({filteredGridItems.length})</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                onDeselectAll();
+                setOnlyShowSelected(false);
+              }}
+              className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors whitespace-nowrap"
+              title="清空全部勾选，方便从0开始跨分类挑选目标"
+            >
+              <Square className="w-3.5 h-3.5 text-slate-400" />
+              <span>清空全部</span>
+            </button>
+          </div>
         </div>
 
-        {/* 搜索与范围筛选 */}
-        <div className="flex items-center gap-2 shrink-0 flex-wrap">
-          {/* 显示范围切换：全部 / 仅看勾选 */}
-          <div className="inline-flex items-center bg-slate-100 p-0.5 rounded-lg border border-slate-200">
+        {/* ETF 名称分类筛选条 */}
+        <div className="pt-2.5 border-t border-slate-100 space-y-2.5 text-xs">
+          {/* 名称主题标签 */}
+          <div className="flex items-center gap-1.5 overflow-x-auto pb-1 scrollbar-none">
+            <span className="text-slate-500 font-medium whitespace-nowrap mr-0.5 flex items-center gap-1">
+              <Tag className="w-3.5 h-3.5 text-rose-500" />
+              名称分类:
+            </span>
             <button
               type="button"
-              onClick={() => setOnlyShowSelected(false)}
-              className={`px-2 py-1 rounded text-xs font-medium transition-all ${
-                !onlyShowSelected
-                  ? 'bg-white text-slate-900 font-bold shadow-2xs'
-                  : 'text-slate-500 hover:text-slate-800'
+              onClick={() => setDedupeSimilarOnly((prev) => !prev)}
+              className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg font-semibold whitespace-nowrap transition-all border mr-1 ${
+                dedupeSimilarOnly
+                  ? 'bg-emerald-600 text-white border-emerald-600 shadow-xs'
+                  : 'bg-emerald-50/80 text-emerald-800 border-emerald-200 hover:bg-emerald-100'
               }`}
+              title="开启后，同名或跟踪同一指数的多只ETF只显示规模/成交额最高的1只代表标的"
             >
-              全部标的 ({etfs.length})
+              <Layers className="w-3.5 h-3.5" />
+              <span>同类只显1只</span>
+              {dedupeSimilarOnly && (
+                <span className="text-[10px] font-mono px-1 rounded bg-white/20">
+                  {preDedupeCount}→{filteredGridItems.length}
+                </span>
+              )}
             </button>
             <button
               type="button"
-              onClick={() => setOnlyShowSelected(true)}
-              className={`px-2 py-1 rounded text-xs font-medium transition-all ${
-                onlyShowSelected
-                  ? 'bg-rose-600 text-white font-bold shadow-2xs'
-                  : 'text-slate-500 hover:text-slate-800'
+              onClick={() => setNameFilter((prev) => ({ ...prev, nameTheme: '全部' }))}
+              className={`px-2.5 py-1 rounded-lg font-medium whitespace-nowrap transition-colors ${
+                nameFilter.nameTheme === '全部'
+                  ? 'bg-rose-600 text-white shadow-xs'
+                  : 'bg-slate-100 text-slate-600 hover:bg-slate-200 hover:text-slate-900'
               }`}
-              title="仅筛选显示在板块一或此表勾选的标的"
             >
-              仅看已勾选 ({selectedCount})
+              全部名称
             </button>
+            {availableNameThemes.map((theme) => {
+              const isActive = nameFilter.nameTheme === theme.id;
+              return (
+                <button
+                  key={theme.id}
+                  type="button"
+                  onClick={() =>
+                    setNameFilter((prev) => ({
+                      ...prev,
+                      nameTheme: isActive ? '全部' : theme.id,
+                    }))
+                  }
+                  className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg font-medium whitespace-nowrap transition-colors ${
+                    isActive
+                      ? 'bg-rose-600 text-white shadow-xs'
+                      : 'bg-slate-50 text-slate-700 border border-slate-200/80 hover:bg-rose-50 hover:border-rose-200 hover:text-rose-700'
+                  }`}
+                >
+                  <span>{theme.label}</span>
+                  <span
+                    className={`text-[10px] font-mono ${
+                      isActive ? 'text-rose-100' : 'text-slate-400'
+                    }`}
+                  >
+                    {theme.count}
+                  </span>
+                </button>
+              );
+            })}
           </div>
 
-          <div className="relative">
-            <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
-            <input
-              type="text"
-              placeholder="搜索代码 / 名称..."
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              className="pl-8 pr-3 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-rose-500 focus:bg-white w-36 sm:w-44"
-            />
+          {/* 基金公司 + 名称排除词 + 命中统计 */}
+          <div className="flex flex-wrap items-center gap-2.5">
+            <div className="flex items-center gap-1.5 bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1">
+              <Building2 className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+              <span className="text-slate-500 whitespace-nowrap">基金公司:</span>
+              <select
+                value={nameFilter.fundIssuer}
+                onChange={(e) =>
+                  setNameFilter((prev) => ({ ...prev, fundIssuer: e.target.value }))
+                }
+                className="bg-transparent text-slate-800 font-medium focus:outline-hidden cursor-pointer pr-1"
+              >
+                <option value="全部">全部基金公司</option>
+                {availableFundIssuers.map((iss) => (
+                  <option key={iss.name} value={iss.name}>
+                    {iss.name} ({iss.count}只)
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="relative min-w-[205px] flex-1 sm:flex-initial">
+              <Ban className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
+              <input
+                type="text"
+                placeholder="排除名称词(空格分隔, 如: 增强 货币)..."
+                value={nameFilter.excludeQuery}
+                onChange={(e) =>
+                  setNameFilter((prev) => ({ ...prev, excludeQuery: e.target.value }))
+                }
+                className="w-full pl-8 pr-7 py-1 bg-slate-50 border border-slate-200 rounded-lg text-xs text-slate-900 placeholder:text-slate-400 focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-rose-500/20 focus:border-rose-500 transition-all"
+              />
+              {nameFilter.excludeQuery && (
+                <button
+                  type="button"
+                  onClick={() =>
+                    setNameFilter((prev) => ({ ...prev, excludeQuery: '' }))
+                  }
+                  className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 text-xs px-1"
+                  title="清空排除词"
+                >
+                  ✕
+                </button>
+              )}
+            </div>
+
+            <div className="flex items-center gap-2 ml-auto">
+              <span className="text-[11px] text-slate-500 bg-slate-100 px-2.5 py-1 rounded-lg font-medium">
+                当前显示{' '}
+                <span className="font-mono font-bold text-slate-900">
+                  {filteredGridItems.length}
+                </span>{' '}
+                / {gridItems.length} 只
+              </span>
+              {hasActiveNameFilter && (
+                <button
+                  type="button"
+                  onClick={handleResetNameFilters}
+                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-700 font-medium transition-colors"
+                  title="重置名称、量化条件、规模及搜索筛选"
+                >
+                  <RotateCcw className="w-3 h-3" />
+                  <span>重置筛选</span>
+                </button>
+              )}
+            </div>
           </div>
 
-          <button
-            type="button"
-            onClick={selectedCount === etfs.length ? onDeselectAll : onSelectAll}
-            className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors whitespace-nowrap"
-          >
-            {selectedCount === etfs.length ? (
-              <CheckSquare className="w-3.5 h-3.5 text-rose-600" />
-            ) : (
-              <Square className="w-3.5 h-3.5 text-slate-400" />
-            )}
-            <span>{selectedCount === etfs.length ? '取消全选' : `全选标的 (${selectedCount})`}</span>
-          </button>
+          {/* 量化特征筛选 + 基金规模 + 多维排序栏 */}
+          <div className="pt-2.5 border-t border-slate-100 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-2.5">
+            {/* 量化特征与规模筛选 */}
+            <div className="flex items-center gap-1.5 flex-wrap">
+              <span className="text-slate-500 font-medium whitespace-nowrap mr-0.5 flex items-center gap-1">
+                <Sliders className="w-3.5 h-3.5 text-slate-400" />
+                量化筛选:
+              </span>
+
+              <button
+                type="button"
+                onClick={() => setIsTouchLowOnly((prev) => !prev)}
+                className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg font-medium transition-colors border ${
+                  isTouchLowOnly
+                    ? 'bg-blue-600 text-white border-blue-600 shadow-xs'
+                    : 'bg-blue-50/80 hover:bg-blue-100 text-blue-800 border-blue-200'
+                }`}
+                title="筛选当前价格处于60日底部区域（偏离60日低点5%以内）的ETF，适合低吸建网格底仓"
+              >
+                <ArrowDownToLine className={`w-3.5 h-3.5 ${isTouchLowOnly ? 'text-white' : 'text-blue-600'}`} />
+                <span>触及低位(60日底)</span>
+                <span className={`text-[10px] font-mono px-1 rounded font-bold ${isTouchLowOnly ? 'bg-white text-blue-700' : 'bg-blue-200/80 text-blue-900'}`}>
+                  {touchLowCount}
+                </span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setIsHighVolOnly((prev) => !prev)}
+                className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg font-medium transition-colors border ${
+                  isHighVolOnly
+                    ? 'bg-rose-600 text-white border-rose-600 shadow-xs'
+                    : 'bg-rose-50/70 hover:bg-rose-100 text-rose-700 border-rose-200'
+                }`}
+                title="筛选ATR% >= 2.6%的高弹性品种，网格价差空间更大"
+              >
+                <Flame className={`w-3.5 h-3.5 ${isHighVolOnly ? 'text-white' : 'text-rose-500'}`} />
+                <span>高波动(ATR≥2.6%)</span>
+                <span className={`text-[10px] font-mono px-1 rounded font-bold ${isHighVolOnly ? 'bg-white text-rose-700' : 'bg-rose-200/70 text-rose-800'}`}>
+                  {highVolCount}
+                </span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setIsAboveAvgOnly((prev) => !prev)}
+                className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg font-medium transition-colors border ${
+                  isAboveAvgOnly
+                    ? 'bg-amber-600 text-white border-amber-600 shadow-xs'
+                    : 'bg-amber-50/70 hover:bg-amber-100 text-amber-800 border-amber-200'
+                }`}
+                title="只看当前ATR超过近20日平均波幅的品种"
+              >
+                <TrendingUp className="w-3.5 h-3.5" />
+                <span>超20日均值</span>
+                <span className={`text-[10px] font-mono px-1 rounded font-bold ${isAboveAvgOnly ? 'bg-white text-amber-700' : 'bg-amber-200/80 text-amber-900'}`}>
+                  {aboveAvgCount}
+                </span>
+              </button>
+
+              {/* 基金规模门槛 */}
+              <div className="flex items-center gap-1 bg-slate-50 border border-slate-200 rounded-lg px-2 py-1">
+                <Coins className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                <span className="text-slate-500 whitespace-nowrap">规模:</span>
+                <select
+                  value={minScale}
+                  onChange={(e) => setMinScale(Number(e.target.value))}
+                  className="bg-transparent text-slate-800 font-medium focus:outline-hidden cursor-pointer"
+                >
+                  <option value={0}>全部规模</option>
+                  <option value={20}>≥ 20亿</option>
+                  <option value={50}>≥ 50亿</option>
+                  <option value={100}>≥ 100亿 (大盘主力)</option>
+                </select>
+              </div>
+            </div>
+
+            {/* 排序控制 */}
+            <div className="flex items-center gap-1.5 flex-wrap">
+              <span className="text-slate-500 font-medium flex items-center gap-1">
+                <ArrowUpDown className="w-3.5 h-3.5 text-slate-400" />
+                排序:
+              </span>
+              {(
+                [
+                  { id: 'gridStepPercent', label: '网格间距%' },
+                  { id: 'gridCount', label: '预估格数' },
+                  { id: 'scaleAmount', label: '基金规模' },
+                  { id: 'volumeAmount', label: '成交额' },
+                ] as const
+              ).map((opt) => {
+                const isActive = gridSortField === opt.id;
+                return (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    onClick={() => handleSortToggle(opt.id)}
+                    className={`inline-flex items-center gap-1 px-2 py-1 rounded-lg border font-medium transition-colors ${
+                      isActive
+                        ? 'bg-rose-50 border-rose-200 text-rose-700'
+                        : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'
+                    }`}
+                  >
+                    <span>{opt.label}</span>
+                    {isActive && (
+                      <span className="font-mono font-bold text-[10px]">
+                        {gridSortDirection === 'desc' ? '↓' : '↑'}
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+              {gridSortField !== 'default' && (
+                <button
+                  type="button"
+                  onClick={() => setGridSortField('default')}
+                  className="px-2 py-1 text-[11px] text-slate-400 hover:text-slate-700 transition-colors"
+                  title="恢复默认排序"
+                >
+                  默认
+                </button>
+              )}
+            </div>
+          </div>
         </div>
       </div>
 
       {/* 核心：已勾选标的专属高亮操作条，提供一键导出选中的ETF图片与CSV */}
       {selectedCount > 0 && (
         <div className="bg-rose-50/90 border border-rose-200/90 rounded-xl px-4 py-3 flex flex-wrap items-center justify-between gap-3 text-xs shadow-2xs">
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
             <span className="w-2.5 h-2.5 rounded-full bg-rose-600 animate-pulse" />
             <span className="font-bold text-rose-950 text-xs">
               已选中 <span className="text-rose-600 font-mono text-sm">{selectedCount}</span> 只 ETF 标的
             </span>
-            <span className="text-slate-500 text-[11px] hidden md:inline">
-              · 可针对性导出这 {selectedCount} 只标的的网格参数长图或下载表格
-            </span>
+            {selectedCount < etfs.length && selectedByCategory.length > 0 ? (
+              <div className="flex items-center gap-1 flex-wrap">
+                {selectedByCategory.slice(0, 7).map((item) => (
+                  <button
+                    key={item.category}
+                    type="button"
+                    onClick={() => handleSelectCategory(item.category)}
+                    className="px-2 py-0.5 rounded bg-white/90 hover:bg-white text-slate-700 border border-rose-200/80 text-[11px] font-medium transition-colors"
+                    title={`点击定位「${item.category}」分类`}
+                  >
+                    {item.category} <span className="font-mono font-bold text-rose-600">{item.count}</span>
+                  </button>
+                ))}
+                {selectedByCategory.length > 7 && (
+                  <span className="text-[11px] text-slate-500">
+                    等 {selectedByCategory.length} 类
+                  </span>
+                )}
+              </div>
+            ) : (
+              <span className="text-slate-500 text-[11px] hidden md:inline">
+                · 可针对性导出这 {selectedCount} 只标的的网格参数长图或下载表格
+              </span>
+            )}
           </div>
           <div className="flex items-center gap-2 flex-wrap">
             <button
@@ -745,9 +1433,19 @@ export const GridTradingSection: React.FC<GridTradingSectionProps> = ({
             </button>
             <button
               type="button"
+              disabled={isExportingXlsx}
+              onClick={() => handleExportGridXlsx(true)}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-emerald-700 hover:bg-emerald-800 text-white font-semibold rounded-lg shadow-2xs transition-colors disabled:opacity-60 cursor-pointer"
+              title={`下载选中 ${selectedCount} 只标的的网格参数与阶梯明细 (.xlsx)`}
+            >
+              <FileSpreadsheet className="w-3.5 h-3.5" />
+              <span>{isExportingXlsx ? '导出中...' : '导出选中 XLSX'}</span>
+            </button>
+            <button
+              type="button"
               onClick={handleExportSelectedCsv}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-white hover:bg-rose-50 text-rose-700 border border-rose-300 font-semibold rounded-lg shadow-2xs transition-colors cursor-pointer"
-              title="下载选中标的的网格参数Excel/CSV表格"
+              title="下载选中标的的网格参数 CSV 表格"
             >
               <Download className="w-3.5 h-3.5 text-rose-600" />
               <span>导出选中CSV表格</span>
@@ -768,13 +1466,53 @@ export const GridTradingSection: React.FC<GridTradingSectionProps> = ({
         <div className="overflow-x-auto">
           <table className="w-full text-left text-xs border-collapse">
             <thead>
-              <tr className="bg-slate-50/80 text-slate-600 font-semibold border-b border-slate-200">
+              <tr className="bg-slate-50/80 text-slate-600 font-semibold border-b border-slate-200 select-none">
                 <th className="py-3 px-3 text-center w-10">选择</th>
                 <th className="py-3 px-2 text-center w-8">#</th>
-                <th className="py-3 px-3">基金名称 / 代码</th>
+                <th className="py-3 px-3">
+                  <button
+                    type="button"
+                    onClick={() => handleSortToggle('code')}
+                    className="inline-flex items-center gap-1 hover:text-slate-900 transition-colors"
+                  >
+                    <span>基金名称 / 代码</span>
+                    {gridSortField === 'code' && (
+                      <span className="font-mono text-[10px] text-rose-600">
+                        {gridSortDirection === 'desc' ? '↓' : '↑'}
+                      </span>
+                    )}
+                  </button>
+                </th>
                 <th className="py-3 px-2">行业类别</th>
-                <th className="py-3 px-2.5 text-center">基金规模</th>
-                <th className="py-3 px-3 text-right">参考现价(¥)</th>
+                <th className="py-3 px-2.5 text-center">
+                  <button
+                    type="button"
+                    onClick={() => handleSortToggle('scaleAmount')}
+                    className="inline-flex items-center gap-1 hover:text-slate-900 transition-colors mx-auto"
+                    title="点击按基金规模排序"
+                  >
+                    <span>基金规模</span>
+                    {gridSortField === 'scaleAmount' && (
+                      <span className="font-mono text-[10px] text-rose-600">
+                        {gridSortDirection === 'desc' ? '↓' : '↑'}
+                      </span>
+                    )}
+                  </button>
+                </th>
+                <th className="py-3 px-3 text-right">
+                  <button
+                    type="button"
+                    onClick={() => handleSortToggle('price')}
+                    className="inline-flex items-center gap-1 hover:text-slate-900 transition-colors ml-auto"
+                  >
+                    <span>参考现价(¥)</span>
+                    {gridSortField === 'price' && (
+                      <span className="font-mono text-[10px] text-rose-600">
+                        {gridSortDirection === 'desc' ? '↓' : '↑'}
+                      </span>
+                    )}
+                  </button>
+                </th>
                 <th className="py-3 px-3 text-right font-bold text-slate-800 bg-slate-100/50">
                   <div className="flex flex-col items-end">
                     <span>基准价 (¥)</span>
@@ -818,15 +1556,41 @@ export const GridTradingSection: React.FC<GridTradingSectionProps> = ({
                   </div>
                 </th>
                 <th className="py-3 px-3 text-right font-bold text-rose-600 bg-rose-50/50">
-                  <div className="flex flex-col items-end">
-                    <span>网格间距 (%)</span>
+                  <button
+                    type="button"
+                    onClick={() => handleSortToggle('gridStepPercent')}
+                    className="flex flex-col items-end ml-auto hover:text-rose-800 transition-colors"
+                    title="点击按网格间距(%)排序"
+                  >
+                    <span className="inline-flex items-center gap-1">
+                      <span>网格间距 (%)</span>
+                      {gridSortField === 'gridStepPercent' && (
+                        <span className="font-mono text-[10px]">
+                          {gridSortDirection === 'desc' ? '↓' : '↑'}
+                        </span>
+                      )}
+                    </span>
                     <span className="text-[10px] font-normal text-rose-500 font-mono">
                       {roundToHalf ? '0.5%倍数' : '浮点值'}
                     </span>
-                  </div>
+                  </button>
                 </th>
                 <th className="py-3 px-3 text-right">单格差价</th>
-                <th className="py-3 px-2 text-center">预估总格数</th>
+                <th className="py-3 px-2 text-center">
+                  <button
+                    type="button"
+                    onClick={() => handleSortToggle('gridCount')}
+                    className="inline-flex items-center gap-1 hover:text-slate-900 transition-colors mx-auto"
+                    title="点击按预估总格数排序"
+                  >
+                    <span>预估总格数</span>
+                    {gridSortField === 'gridCount' && (
+                      <span className="font-mono text-[10px] text-rose-600">
+                        {gridSortDirection === 'desc' ? '↓' : '↑'}
+                      </span>
+                    )}
+                  </button>
+                </th>
                 <th className="py-3 px-3 text-center">操作</th>
               </tr>
             </thead>
@@ -839,8 +1603,11 @@ export const GridTradingSection: React.FC<GridTradingSectionProps> = ({
                 </tr>
               ) : (
                 filteredGridItems.map((item, idx) => {
-                  const originalEtf = etfs.find((e) => e.id === item.id);
+                  const originalEtf = etfById.get(item.id);
                   const isSelected = !!originalEtf?.selected;
+                  const low60 = originalEtf?.low60d || originalEtf?.low120d || originalEtf?.low || 0;
+                  const isTouchLow = low60 > 0 && item.price <= low60 * 1.0501;
+                  const lowDiffPct = low60 > 0 ? (((item.price - low60) / low60) * 100).toFixed(1) : '0.0';
 
                   return (
                     <tr
@@ -871,11 +1638,32 @@ export const GridTradingSection: React.FC<GridTradingSectionProps> = ({
 
                       {/* 基金名称与代码 */}
                       <td className="py-2.5 px-3">
-                        <div className="flex items-center gap-1.5">
+                        <div className="flex items-center gap-1.5 flex-wrap">
                           <span className="font-bold text-slate-900">{item.name}</span>
                           {item.isCustomized && (
                             <span className="px-1 py-0.2 rounded text-[9px] font-medium bg-amber-100 text-amber-800">
                               自定义
+                            </span>
+                          )}
+                          {dedupeSimilarOnly && (similarGroupCounts[item.id] ?? 1) > 1 && (
+                            <span
+                              className="px-1.5 py-0.2 rounded text-[9px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-200"
+                              title={`已开启「同类只显1只」，此标的代表同类 ${similarGroupCounts[item.id]} 只ETF`}
+                            >
+                              同类共{similarGroupCounts[item.id]}只·代表
+                            </span>
+                          )}
+                          {isTouchLow && (
+                            <span
+                              className="px-1.5 py-0.2 rounded text-[9px] font-bold bg-blue-100 text-blue-800 border border-blue-200"
+                              title={`当前价距60日低点 ¥${low60.toFixed(3)} 仅 +${lowDiffPct}%`}
+                            >
+                              低位 +{lowDiffPct}%
+                            </span>
+                          )}
+                          {originalEtf?.isAboveHistoricalAvg && (
+                            <span className="px-1 py-0.2 rounded text-[9px] font-bold bg-rose-100 text-rose-700 border border-rose-200">
+                              放量
                             </span>
                           )}
                         </div>

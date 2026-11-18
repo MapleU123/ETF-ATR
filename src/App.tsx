@@ -20,11 +20,21 @@ import { FilterBar } from './components/FilterBar';
 import { EtfTable } from './components/EtfTable';
 import { ExportModal } from './components/ExportModal';
 import { TurtleCalculatorModal } from './components/TurtleCalculatorModal';
+import { T0BacktestModal } from './components/T0BacktestModal';
 import { AddEtfModal } from './components/AddEtfModal';
 import { AtrKnowledgeSection } from './components/AtrKnowledgeSection';
 import { GridTradingSection } from './components/GridTradingSection';
 import { T0GridTradingSection } from './components/T0GridTradingSection';
 import { classifyEtfByName } from './utils/categoryMatcher';
+import {
+  EtfNameFilterState,
+  DEFAULT_NAME_FILTER,
+  matchesEtfNameFilter,
+  getAvailableNameThemes,
+  getAvailableFundIssuers,
+  dedupeSimilarEtfs,
+  parseEtfScaleValue,
+} from './utils/etfNameFilter';
 
 const CATEGORIES: EtfCategory[] = [
   '全部',
@@ -51,13 +61,17 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<ActiveTab>('atr_volatility');
   const [atrPeriod, setAtrPeriod] = useState<AtrPeriod>(14);
   const [etfs, setEtfs] = useState<EtfItem[]>(() => getInitialEtfList(14));
-  const [currentCategory, setCurrentCategory] = useState<EtfCategory>('全部');
+  const [selectedCategories, setSelectedCategories] = useState<EtfCategory[]>([]); // 空数组表示全部
+  const [isMultiCategoryMode, setIsMultiCategoryMode] = useState(false); // 跨分类多选开关
+  const [dedupeSimilarOnly, setDedupeSimilarOnly] = useState(false); // 同类只显示一只开关
+  const [onlyShowSelected, setOnlyShowSelected] = useState(false); // 仅看跨分类已选目标
   const [searchQuery, setSearchQuery] = useState('');
   const [sortField, setSortField] = useState<SortField>('atrPercent');
   const [sortDirection, setSortDirection] = useState<SortDirection>('desc');
   const [highlightedId, setHighlightedId] = useState<string | null>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [isTouchLowOnly, setIsTouchLowOnly] = useState(false); // 触及低位(60日底部)开关状态
+  const [nameFilter, setNameFilter] = useState<EtfNameFilterState>(DEFAULT_NAME_FILTER);
 
   // 真实行情连接状态
   const [isLoadingRealtime, setIsLoadingRealtime] = useState(false);
@@ -71,6 +85,8 @@ export default function App() {
   const [exportSelectedOnly, setExportSelectedOnly] = useState<boolean>(false);
   const [isTurtleCalcOpen, setIsTurtleCalcOpen] = useState(false);
   const [turtleEtfId, setTurtleEtfId] = useState<string | undefined>(undefined);
+  const [isT0BacktestOpen, setIsT0BacktestOpen] = useState(false);
+  const [t0BacktestEtfId, setT0BacktestEtfId] = useState<string | undefined>(undefined);
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
 
   const selectedCount = etfs.filter((e) => e.selected).length;
@@ -149,28 +165,39 @@ export default function App() {
     );
   }, []);
 
-  // 全选/全不选当前可见标的
-  const handleSelectAllVisible = useCallback((checked: boolean) => {
-    setEtfs((prev) => {
-      // 获取当前符合筛选的 id 集合
-      const visibleIds = new Set(
-        prev
-          .filter((e) => {
-            const matchCat = currentCategory === '全部' || e.category === currentCategory;
-            const matchSearch =
-              !searchQuery ||
-              e.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-              e.code.includes(searchQuery);
-            return matchCat && matchSearch;
-          })
-          .map((e) => e.id)
-      );
+  // 清空全部跨分类勾选
+  const handleDeselectAllGlobal = useCallback(() => {
+    setEtfs((prev) => prev.map((e) => ({ ...e, selected: false })));
+    setOnlyShowSelected(false);
+  }, []);
 
-      return prev.map((e) =>
-        visibleIds.has(e.id) ? { ...e, selected: checked } : e
-      );
+  // 切换行业分类（支持单选与跨分类多选）
+  const handleSelectCategory = useCallback(
+    (cat: EtfCategory) => {
+      if (cat === '全部') {
+        setSelectedCategories([]);
+      } else if (isMultiCategoryMode) {
+        setSelectedCategories((prev) =>
+          prev.includes(cat) ? prev.filter((c) => c !== cat) : [...prev, cat]
+        );
+      } else {
+        setSelectedCategories([cat]);
+      }
+      setNameFilter((prev) => ({ ...prev, nameTheme: '全部' }));
+    },
+    [isMultiCategoryMode]
+  );
+
+  // 网格页按指定ID集合全选
+  const handleSelectGridIds = useCallback((ids?: string[]) => {
+    setEtfs((prev) => {
+      if (!ids) {
+        return prev.map((e) => ({ ...e, selected: true }));
+      }
+      const idSet = new Set(ids);
+      return prev.map((e) => (idSet.has(e.id) ? { ...e, selected: true } : e));
     });
-  }, [currentCategory, searchQuery]);
+  }, []);
 
   // 仅选高波标的 (ATR% >= 2.6%)
   const handleSelectHighVolOnly = useCallback(() => {
@@ -189,7 +216,7 @@ export default function App() {
       category: classifyEtfByName(newEtf.name, newEtf.code, newEtf.category),
     };
     setEtfs((prev) => [classified, ...prev]);
-    setCurrentCategory('全部');
+    setSelectedCategories([]);
     setHighlightedId(classified.id);
     setToastMessage(`成功添加「${classified.code} ${classified.name}」，已归类至【${classified.category}】！`);
     setTimeout(() => {
@@ -259,8 +286,9 @@ export default function App() {
       }
 
       // 重置分类为全部，防止因分类过滤而看不见
-      setCurrentCategory('全部');
+      setSelectedCategories([]);
       setSearchQuery('');
+      setOnlyShowSelected(false);
       setHighlightedId(targetItem.id);
 
       const msg =
@@ -297,16 +325,48 @@ export default function App() {
     setIsTurtleCalcOpen(true);
   }, []);
 
-  // 过滤与排序列表
-  const filteredAndSortedEtfs = useMemo(() => {
-    let result = etfs.filter((e) => {
-      const matchCat = currentCategory === '全部' || e.category === currentCategory;
-      const matchSearch =
-        !searchQuery ||
-        e.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-        e.code.includes(searchQuery);
+  // 打开板块一：日内做T网格回测窗口
+  const handleOpenT0Backtest = useCallback((item?: EtfItem) => {
+    setT0BacktestEtfId(item?.id);
+    setIsT0BacktestOpen(true);
+  }, []);
 
-      if (!matchCat || !matchSearch) return false;
+  // 各行业分类下的已选数量统计（便于跨分类选择时掌握进度）
+  const selectedByCategory = useMemo(() => {
+    const map = new Map<EtfCategory, number>();
+    for (const e of etfs) {
+      if (e.selected) {
+        map.set(e.category, (map.get(e.category) || 0) + 1);
+      }
+    }
+    return Array.from(map.entries()).map(([category, count]) => ({ category, count }));
+  }, [etfs]);
+
+  // 当前行业分类（支持多选）下的标的子集（用于动态计算名称主题与基金公司选项）
+  const categoryScopedEtfs = useMemo(() => {
+    return etfs.filter((e) => {
+      if (onlyShowSelected && !e.selected) return false;
+      if (selectedCategories.length > 0 && !selectedCategories.includes(e.category)) {
+        return false;
+      }
+      return true;
+    });
+  }, [etfs, selectedCategories, onlyShowSelected]);
+
+  const availableNameThemes = useMemo(
+    () => getAvailableNameThemes(categoryScopedEtfs),
+    [categoryScopedEtfs]
+  );
+
+  const availableFundIssuers = useMemo(
+    () => getAvailableFundIssuers(categoryScopedEtfs),
+    [categoryScopedEtfs]
+  );
+
+  // 过滤、同类去重与排序列表
+  const { filteredAndSortedEtfs, similarGroupCounts, preDedupeCount } = useMemo(() => {
+    let result = categoryScopedEtfs.filter((e) => {
+      if (!matchesEtfNameFilter(e, searchQuery, nameFilter)) return false;
 
       // 触及低位筛选：当前价格在60日内处于底部区域（5%偏离度以内）
       if (isTouchLowOnly) {
@@ -318,7 +378,16 @@ export default function App() {
       return true;
     });
 
-    result.sort((a, b) => {
+    const preCount = result.length;
+    let groupCounts: Record<string, number> = {};
+
+    if (dedupeSimilarOnly) {
+      const deduped = dedupeSimilarEtfs(result);
+      result = deduped.items;
+      groupCounts = deduped.groupCounts;
+    }
+
+    const sorted = [...result].sort((a, b) => {
       let valA: number = 0;
       let valB: number = 0;
 
@@ -338,16 +407,8 @@ export default function App() {
         valA = a.volumeAmount;
         valB = b.volumeAmount;
       } else if (sortField === 'scaleAmount') {
-        const parseScale = (item: EtfItem): number => {
-          if (item.scaleAmount !== undefined && item.scaleAmount > 0) return item.scaleAmount;
-          if (item.scaleText) {
-            const num = parseFloat(item.scaleText.replace(/[^0-9.]/g, ''));
-            if (!isNaN(num)) return num;
-          }
-          return 0;
-        };
-        valA = parseScale(a);
-        valB = parseScale(b);
+        valA = parseEtfScaleValue(a);
+        valB = parseEtfScaleValue(b);
       } else if (sortField === 'code') {
         return sortDirection === 'desc'
           ? b.code.localeCompare(a.code)
@@ -357,8 +418,31 @@ export default function App() {
       return sortDirection === 'desc' ? valB - valA : valA - valB;
     });
 
-    return result;
-  }, [etfs, currentCategory, searchQuery, sortField, sortDirection, isTouchLowOnly]);
+    return {
+      filteredAndSortedEtfs: sorted,
+      similarGroupCounts: groupCounts,
+      preDedupeCount: preCount,
+    };
+  }, [
+    categoryScopedEtfs,
+    searchQuery,
+    nameFilter,
+    sortField,
+    sortDirection,
+    isTouchLowOnly,
+    dedupeSimilarOnly,
+  ]);
+
+  // 全选/全不选当前可见标的（所见即所选，兼容同类去重与跨分类筛选）
+  const handleSelectAllVisible = useCallback(
+    (checked: boolean) => {
+      const visibleIds = new Set(filteredAndSortedEtfs.map((e) => e.id));
+      setEtfs((prev) =>
+        prev.map((e) => (visibleIds.has(e.id) ? { ...e, selected: checked } : e))
+      );
+    },
+    [filteredAndSortedEtfs]
+  );
 
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col">
@@ -391,7 +475,10 @@ export default function App() {
             <StatsOverview
               etfs={etfs}
               atrPeriod={atrPeriod}
-              onSelectCategory={setCurrentCategory}
+              onSelectCategory={(cat) => {
+                setSelectedCategories(cat === '全部' ? [] : [cat]);
+                setNameFilter((prev) => ({ ...prev, nameTheme: '全部' }));
+              }}
               onOpenExport={() => handleOpenExport('full_table')}
             />
 
@@ -405,10 +492,25 @@ export default function App() {
             {/* Toolbar & Filter Bar */}
             <FilterBar
               categories={CATEGORIES}
-              currentCategory={currentCategory}
-              onSelectCategory={setCurrentCategory}
+              selectedCategories={selectedCategories}
+              onSelectCategory={handleSelectCategory}
+              isMultiCategoryMode={isMultiCategoryMode}
+              onToggleMultiCategoryMode={() => setIsMultiCategoryMode((prev) => !prev)}
+              selectedByCategory={selectedByCategory}
+              onlyShowSelected={onlyShowSelected}
+              onToggleOnlyShowSelected={() => setOnlyShowSelected((prev) => !prev)}
+              onDeselectAllGlobal={handleDeselectAllGlobal}
+              onOpenExportSelected={() => handleOpenExport('full_table', undefined, true)}
+              dedupeSimilarOnly={dedupeSimilarOnly}
+              onToggleDedupeSimilar={() => setDedupeSimilarOnly((prev) => !prev)}
+              preDedupeCount={preDedupeCount}
               searchQuery={searchQuery}
               onSearchChange={setSearchQuery}
+              nameFilter={nameFilter}
+              onNameFilterChange={setNameFilter}
+              availableNameThemes={availableNameThemes}
+              availableFundIssuers={availableFundIssuers}
+              filteredCount={filteredAndSortedEtfs.length}
               atrPeriod={atrPeriod}
               onPeriodChange={handlePeriodChange}
               sortField={sortField}
@@ -436,6 +538,7 @@ export default function App() {
               onToggleSelect={handleToggleSelect}
               onSelectAllVisible={handleSelectAllVisible}
               onOpenTurtleWithEtf={handleOpenTurtleWithEtf}
+              onOpenT0Backtest={handleOpenT0Backtest}
               onDeleteEtf={handleDeleteEtf}
               sortField={sortField}
               sortDirection={sortDirection}
@@ -444,6 +547,7 @@ export default function App() {
               searchQuery={searchQuery}
               onQuickAddFromQuery={handleQuickAddOrShow}
               isTouchLowOnly={isTouchLowOnly}
+              similarGroupCounts={dedupeSimilarOnly ? similarGroupCounts : undefined}
             />
 
             {/* Knowledge & Quantitative Guidance */}
@@ -456,7 +560,7 @@ export default function App() {
             atrPeriod={atrPeriod}
             onPeriodChange={handlePeriodChange}
             onToggleSelect={handleToggleSelect}
-            onSelectAll={handleSelectAllVisible}
+            onSelectAll={handleSelectGridIds}
             onDeselectAll={() => setEtfs((prev) => prev.map((e) => ({ ...e, selected: false })))}
             onOpenExportGrid={(items, selectedOnly) =>
               handleOpenExport('grid_trading', items, selectedOnly !== undefined ? selectedOnly : (selectedCount > 0))
@@ -517,6 +621,15 @@ export default function App() {
         defaultEtfId={turtleEtfId}
         atrPeriod={atrPeriod}
         onPeriodChange={handlePeriodChange}
+      />
+
+      {/* Section 1 Intraday T+0 Grid Backtest Modal */}
+      <T0BacktestModal
+        isOpen={isT0BacktestOpen}
+        onClose={() => setIsT0BacktestOpen(false)}
+        etfs={etfs}
+        defaultEtfId={t0BacktestEtfId}
+        atrPeriod={atrPeriod}
       />
 
       {/* Add Custom ETF Modal */}
